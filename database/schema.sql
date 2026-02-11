@@ -1,6 +1,7 @@
 -- ============================================================================
--- UBUNTU POOLS DATABASE SCHEMA
+-- UBUNTU POOLS DATABASE SCHEMA - SECURITY FIXED VERSION
 -- Production-Ready PostgreSQL/Supabase Schema
+-- All Supabase linter warnings addressed
 -- ============================================================================
 
 -- Enable necessary extensions
@@ -223,6 +224,9 @@ CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_a
 CREATE INDEX IF NOT EXISTS idx_constitutions_pool ON pool_constitutions(pool_id);
 CREATE INDEX IF NOT EXISTS idx_constitutions_active ON pool_constitutions(is_active) WHERE is_active = TRUE;
 
+-- Constitution clauses indexes
+CREATE INDEX IF NOT EXISTS idx_clauses_constitution ON constitution_clauses(constitution_id);
+
 -- Signatures indexes
 CREATE INDEX IF NOT EXISTS idx_signatures_pool ON member_signatures(pool_id);
 CREATE INDEX IF NOT EXISTS idx_signatures_user ON member_signatures(user_id);
@@ -238,17 +242,21 @@ CREATE INDEX IF NOT EXISTS idx_votes_proposal ON votes(proposal_id);
 CREATE INDEX IF NOT EXISTS idx_votes_user ON votes(user_id);
 
 -- ============================================================================
--- TRIGGERS
+-- TRIGGERS - WITH SECURITY FIX (SET search_path)
 -- ============================================================================
 
 -- Update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
 BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -261,7 +269,11 @@ CREATE TRIGGER update_constitutions_updated_at BEFORE UPDATE ON pool_constitutio
 
 -- Update pool total_pool_value when transaction completed
 CREATE OR REPLACE FUNCTION update_pool_value_on_transaction()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
 BEGIN
     IF NEW.status = 'completed' AND (OLD.status IS NULL OR OLD.status != 'completed') THEN
         IF NEW.type = 'contribution' THEN
@@ -276,7 +288,7 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER transaction_updates_pool_value
 AFTER INSERT OR UPDATE ON transactions
@@ -284,7 +296,11 @@ FOR EACH ROW EXECUTE FUNCTION update_pool_value_on_transaction();
 
 -- Update pool member count
 CREATE OR REPLACE FUNCTION update_pool_member_count()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
         UPDATE pools 
@@ -297,7 +313,7 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER pool_member_count_trigger
 AFTER INSERT OR DELETE ON pool_members
@@ -305,7 +321,11 @@ FOR EACH ROW EXECUTE FUNCTION update_pool_member_count();
 
 -- Update proposal vote counts
 CREATE OR REPLACE FUNCTION update_proposal_vote_counts()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.vote = 'yes' THEN
@@ -343,7 +363,7 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER update_proposal_votes
 AFTER INSERT OR UPDATE OR DELETE ON votes
@@ -351,7 +371,11 @@ FOR EACH ROW EXECUTE FUNCTION update_proposal_vote_counts();
 
 -- Update trust score on transaction completion
 CREATE OR REPLACE FUNCTION update_trust_score_on_payment()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
 DECLARE
     is_on_time BOOLEAN;
     pool_next_due DATE;
@@ -377,14 +401,14 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER update_trust_on_payment
 AFTER UPDATE ON transactions
 FOR EACH ROW EXECUTE FUNCTION update_trust_score_on_payment();
 
 -- ============================================================================
--- ROW LEVEL SECURITY (RLS)
+-- ROW LEVEL SECURITY (RLS) - COMPLETE POLICIES
 -- ============================================================================
 
 -- Enable RLS on all tables
@@ -425,6 +449,73 @@ USING (
 CREATE POLICY "Users can view their own transactions" ON transactions FOR SELECT 
 USING (user_id = auth.uid());
 
+CREATE POLICY "Pool members can view pool transactions" ON transactions FOR SELECT
+USING (
+    EXISTS (
+        SELECT 1 FROM pool_members pm
+        WHERE pm.pool_id = transactions.pool_id
+        AND pm.user_id = auth.uid()
+    )
+);
+
+-- Pool constitutions policies
+CREATE POLICY "Pool members can view constitutions" ON pool_constitutions FOR SELECT
+USING (
+    EXISTS (
+        SELECT 1 FROM pool_members pm
+        WHERE pm.pool_id = pool_constitutions.pool_id
+        AND pm.user_id = auth.uid()
+    )
+);
+
+CREATE POLICY "Pool admins can create constitutions" ON pool_constitutions FOR INSERT
+WITH CHECK (
+    EXISTS (
+        SELECT 1 FROM pool_members pm
+        WHERE pm.pool_id = pool_constitutions.pool_id
+        AND pm.user_id = auth.uid()
+        AND pm.role = 'admin'
+    )
+);
+
+-- Constitution clauses policies
+CREATE POLICY "Pool members can view clauses" ON constitution_clauses FOR SELECT
+USING (
+    EXISTS (
+        SELECT 1 FROM pool_constitutions pc
+        JOIN pool_members pm ON pm.pool_id = pc.pool_id
+        WHERE pc.id = constitution_clauses.constitution_id
+        AND pm.user_id = auth.uid()
+    )
+);
+
+CREATE POLICY "Pool admins can manage clauses" ON constitution_clauses FOR ALL
+USING (
+    EXISTS (
+        SELECT 1 FROM pool_constitutions pc
+        JOIN pool_members pm ON pm.pool_id = pc.pool_id
+        WHERE pc.id = constitution_clauses.constitution_id
+        AND pm.user_id = auth.uid()
+        AND pm.role = 'admin'
+    )
+);
+
+-- Member signatures policies
+CREATE POLICY "Users can view their signatures" ON member_signatures FOR SELECT
+USING (user_id = auth.uid());
+
+CREATE POLICY "Pool members can view pool signatures" ON member_signatures FOR SELECT
+USING (
+    EXISTS (
+        SELECT 1 FROM pool_members pm
+        WHERE pm.pool_id = member_signatures.pool_id
+        AND pm.user_id = auth.uid()
+    )
+);
+
+CREATE POLICY "Users can create their own signatures" ON member_signatures FOR INSERT
+WITH CHECK (auth.uid() = user_id);
+
 -- Proposals policies
 CREATE POLICY "Pool members can view proposals" ON proposals FOR SELECT 
 USING (
@@ -435,9 +526,59 @@ USING (
     )
 );
 
+CREATE POLICY "Pool members can create proposals" ON proposals FOR INSERT
+WITH CHECK (
+    EXISTS (
+        SELECT 1 FROM pool_members pm
+        WHERE pm.pool_id = proposals.pool_id
+        AND pm.user_id = auth.uid()
+        AND pm.status = 'active'
+    )
+);
+
+-- Votes policies
+CREATE POLICY "Pool members can view votes" ON votes FOR SELECT
+USING (
+    EXISTS (
+        SELECT 1 FROM proposals p
+        JOIN pool_members pm ON pm.pool_id = p.pool_id
+        WHERE p.id = votes.proposal_id
+        AND pm.user_id = auth.uid()
+    )
+);
+
+CREATE POLICY "Users can create their own votes" ON votes FOR INSERT
+WITH CHECK (
+    auth.uid() = user_id
+    AND EXISTS (
+        SELECT 1 FROM proposals p
+        JOIN pool_members pm ON pm.pool_id = p.pool_id
+        WHERE p.id = votes.proposal_id
+        AND pm.user_id = auth.uid()
+        AND pm.status = 'active'
+    )
+);
+
+CREATE POLICY "Users can update their own votes" ON votes FOR UPDATE
+USING (auth.uid() = user_id);
+
 -- ============================================================================
--- SEED DATA (OPTIONAL - FOR DEVELOPMENT)
+-- COMMENTS FOR DOCUMENTATION
 -- ============================================================================
 
--- This section can be commented out for production
--- INSERT seed data here if needed for testing
+COMMENT ON TABLE users IS 'User accounts and profiles';
+COMMENT ON TABLE trust_metrics IS 'Trust scores and reputation metrics for users';
+COMMENT ON TABLE pools IS 'Community pooling groups';
+COMMENT ON TABLE pool_members IS 'Pool membership and roles';
+COMMENT ON TABLE transactions IS 'Financial transactions for pools';
+COMMENT ON TABLE pool_constitutions IS 'Governance documents for pools';
+COMMENT ON TABLE constitution_clauses IS 'Individual clauses within constitutions';
+COMMENT ON TABLE member_signatures IS 'Digital signatures on constitutions';
+COMMENT ON TABLE proposals IS 'Governance proposals for pools';
+COMMENT ON TABLE votes IS 'Votes on proposals';
+
+COMMENT ON FUNCTION update_updated_at_column() IS 'Trigger function to automatically update updated_at timestamp';
+COMMENT ON FUNCTION update_pool_value_on_transaction() IS 'Trigger function to update pool total value when transactions complete';
+COMMENT ON FUNCTION update_pool_member_count() IS 'Trigger function to maintain accurate member count';
+COMMENT ON FUNCTION update_proposal_vote_counts() IS 'Trigger function to maintain vote tallies';
+COMMENT ON FUNCTION update_trust_score_on_payment() IS 'Trigger function to update trust scores based on payment behavior';
